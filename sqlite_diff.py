@@ -1,9 +1,10 @@
 #! Python 3.7
 import sqlite3
+import os
+from datetime import datetime
 from sqlite3 import Error
 
-DEBUG = True
-list_table_query = "select name from sqlite_master where type = 'table'"
+DEBUG = False
 
 def create_connection(db_file):
     """ create a database connection to the SQLite database
@@ -19,13 +20,15 @@ def create_connection(db_file):
  
     return None
 
-def get_common_tables(old_conn, new_conn):
+def get_common_tables(old_conn, new_conn):    
     """ a comparison function which checks for tables with the same name
     :param 
         old_conn: the connection to the old db
         new_conn: the connection to the new db
     :return: A list of table names
     """
+
+    list_table_query = "select name from sqlite_master where type = 'table'"
 
     old_conn.row_factory = lambda cursor, row: row[0]
     new_conn.row_factory = lambda cursor, row: row[0]
@@ -38,6 +41,21 @@ def get_common_tables(old_conn, new_conn):
 
     # no need for any fancy optimized algorithms since this is always O(n). list has no repeated items
     return [value for value in new_tables if value in old_tables] 
+
+def format_sqlite_value(in_value):
+    """ will add quotes around it if its a string
+    :param
+        in_value: an object that is to be returned with or without quotes
+    """
+    return in_value if type(input) in (int, float, bool) else "'{}'".format(in_value)
+
+def append_eql_condition(in_value):
+    """ appends an equal condition to a string but the function will
+        add quotes around it if its a string
+    :param
+        in_value: an object that is to be converted to the equals clause
+    """
+    return "=" + format_sqlite_value(in_value)
 
 def get_primary_key(conn, table, columns):
     """ attempts to reverse lookup the primary key by querying the table using the first column
@@ -66,10 +84,8 @@ def get_primary_key(conn, table, columns):
             
             if row[i] is None:
                 count_row_query += "=NULL"
-            elif type(row[i]) in (int, float, bool):
-                count_row_query += "={}".format(row[i])
             else:
-                count_row_query += "='{}'".format(row[i])
+                count_row_query += append_eql_condition(row[i])
 
             primary_key.append(column)
             count = conn.execute(count_row_query).fetchone()
@@ -80,15 +96,75 @@ def get_primary_key(conn, table, columns):
     
     # if no primary key was found then the primary key is made up of all columns
     return columns
-    
 
-def get_table_structure_diff(old_conn, new_conn, old_db_filename, new_db_filename):
+def equal_stmt_list_generator(columns, data):
+    statement_list = []
+    for col_idx, col_value in enumerate(data):
+        col_name = columns[col_idx]
+        statement_list.append('`{}`'.format(col_name) + append_eql_condition(col_value))
+    
+    return statement_list
+
+def generate_insert_query(table, pk, data, column = ''):
+    """ generates a UPDATE query with WHERE clauses given a table name and columns
+        and sets it to the given data
+    :params
+        table: the name of the table
+        pk: the primary key data for the table
+        data: the data that does not belong to the primary key
+        column: column names to generate for the insert statement. this is optional since some times we are 100% sure of the column order
+    :return: an INSERT statement string
+    """
+
+    insert_query_template = "INSERT INTO `{}` {} VALUES ({});"
+    data_list = [format_sqlite_value(key) for key in pk] + [format_sqlite_value(d) for d in data]
+
+    return insert_query_template.format(table, column, ', '.join(data_list))
+
+
+def generate_update_query(table, where_cols, where_data, update_cols, update_data):
+    """ generates a UPDATE query with WHERE clauses given a table name and columns
+        and sets it to the given data
+    :params
+        table: the name of the table
+        where_cols: the column names to use for adding WHERE clause
+        where_data: the data matching the where columns
+        update_cols: the columns names to use for setting the SET values
+        update_data: the data used to set the values of the update SET
+    :return: a UPDATE statement with WHERE clauses
+    """
+
+    update_query_template = "UPDATE `{}` SET {} WHERE {};"
+    update_set = equal_stmt_list_generator(update_cols, update_data)
+    where_clauses = equal_stmt_list_generator(where_cols, where_data)
+
+    return update_query_template.format(table, ', '.join(update_set), ' AND '.join(where_clauses))
+        
+def generate_del_query(table, where_cols, row_data):
+    """ generates a DELETE query with WHERE clauses given a table name and columns
+    :params
+        table: the name of the table
+        where_cols: the column names to use for adding WHERE clause
+        row_data: the data matching the where columns
+    :return: a DELETE statement with WHERE clauses
+    """
+
+    if len(where_cols) != len(row_data):
+        raise Exception("columns and row data are of different lengths")
+    
+    delete_query_template = "DELETE FROM `{}` WHERE {};"
+    where_clauses = equal_stmt_list_generator(where_cols, row_data)
+    
+    return delete_query_template.format(table, ' AND '.join(where_clauses))
+
+def get_table_data_diff(old_conn, new_conn, old_db_filename, new_db_filename):
     """ compares tables which exist in both DBs and checks to see 
-        if there are any differences between the two.
+        if there are any differences in rows between the two.
     :param 
         old_conn: the connection to the old db
         new_conn: the connection to the new db
     """
+    diff_statements = []
     
     old_cursor = old_conn.cursor()
     new_cursor = new_conn.cursor()
@@ -106,27 +182,30 @@ def get_table_structure_diff(old_conn, new_conn, old_db_filename, new_db_filenam
     for table in common_tables:
         old_schema = old_cursor.execute(pragma_table_info_query.format(table)).fetchall()
         new_schema = new_cursor.execute(pragma_table_info_query.format(table)).fetchall()
-        print("### %s ###" % table)
+        if DEBUG:
+            print("### %s ###" % table)
 
         # get difference in rows
         if (old_schema == new_schema):
             columns = [col[1] for col in old_schema]
-            pk = get_primary_key(old_cursor, table, columns)
-            data_cols = set(columns) - set(pk)
-            #print("primary: {} ({}), others: {} ({})".format(pk, len(pk), others, len(data)))
+            orig_pk = get_primary_key(old_cursor, table, columns)
+            data_cols_array = list(set(columns) - set(orig_pk))
 
-            pk = ", ".join('`{0}`'.format(k) for k in pk)
+            if DEBUG:
+                print("primary: {} ({}), others: {} ({})".format(orig_pk, len(orig_pk), data_cols_array, len(data_cols_array)))
+
+            pk = ", ".join('`{0}`'.format(k) for k in orig_pk)
 
             # this will generate the statement to select "primary key"
             select_by_pk = select_column_rows_query.format(pk, table) 
 
-            if len(data_cols) == 0:
+            if len(data_cols_array) == 0:
                 # get everything if the primary key are all the columns
                 select_rows_stmt = select_all_rows_query.format(table)
                 old_row_data = old_cursor.execute(select_rows_stmt).fetchall()
                 new_row_data = new_cursor.execute(select_rows_stmt).fetchall()
             else:
-                data_cols = ", ".join('`{}`'.format(k) for k in data_cols)
+                data_cols = ", ".join('`{}`'.format(k) for k in data_cols_array)
                 select_rows_stmt = select_column_rows_query.format(data_cols, table)
                 old_row_data = old_cursor.execute(select_rows_stmt).fetchall()
                 new_row_data = new_cursor.execute(select_rows_stmt).fetchall()
@@ -154,23 +233,39 @@ def get_table_structure_diff(old_conn, new_conn, old_db_filename, new_db_filenam
                 
                 old_hashmap = dict(zip(old_row_ids_hashed, old_row_data_hashed))
                 new_hashmap = dict(zip(new_row_ids_hashed, new_row_data_hashed))
+                
+                new_hashmap_pk_unhashed = dict(zip(new_row_ids_hashed, new_rows_ids))
+                new_hashmap_data_unhashed = dict(zip(new_row_ids_hashed, new_row_data))
 
                 not_inside_count = 0
                 inside_count = 0
                 new_row_count = 0
                 data_changed = 0
-                for old_hashed_pk in old_row_ids_hashed:
+                for index, old_hashed_pk in enumerate(old_row_ids_hashed):
                     # Attempts to get the row information from the hashed primary key
                     # returns false if not present in the dictionary
                     in_new_table = new_hashmap.get(old_hashed_pk, False)
 
+                    where_cols = (data_cols_array, orig_pk) [len(data_cols_array) == 0]
+                    old_row = old_row_data[index]
+
                     if not in_new_table:
                         # generate delete statement
+                        delete_where_string = generate_del_query(table, where_cols, old_row)  + '\n'
+
+                        if DEBUG:
+                            print(delete_where_string)
+
+                        diff_statements.append(delete_where_string)
                         not_inside_count += 1
                     else:
                         if in_new_table != old_hashmap[old_hashed_pk]:
-                            print("Comparing hash in new table ({}) to old ({})".format(in_new_table, old_hashmap[old_hashed_pk]))
+
+                            if DEBUG:
+                                print("Comparing hash in new table ({}) to old ({})".format(in_new_table, old_hashmap[old_hashed_pk]))
                             # TODO: go look for the data which belongs to the new data and then do an UPDATE SET statement for starters
+                            update_string = generate_update_query(table, where_cols, old_row, where_cols, new_hashmap_data_unhashed[old_hashed_pk]) + '\n'
+                            diff_statements.append(update_string)
                             data_changed += 1
 
                         inside_count += 1
@@ -180,6 +275,9 @@ def get_table_structure_diff(old_conn, new_conn, old_db_filename, new_db_filenam
 
                     if not in_old_table:
                         # generate insert statement
+                        new_pk = new_hashmap_pk_unhashed[new_hash_pk]
+                        new_data = new_hashmap_data_unhashed[new_hash_pk]
+                        diff_statements.append(generate_insert_query(table, new_pk, new_data) + '\n')
                         new_row_count += 1
                 
                 if DEBUG:
@@ -191,24 +289,44 @@ def get_table_structure_diff(old_conn, new_conn, old_db_filename, new_db_filenam
 
             else:
                 equal += 1
-                print("Tables are identical")
+                if DEBUG:
+                    print("Tables are identical")
     
     if DEBUG:
         print("Total - not equal: {}. equal: {}".format(notequal, equal))
 
+    return diff_statements
+
+def write_to_file(old_name, new_name, diff_statements, ext = "sql"):
+    old_noext = os.path.splitext(old_name)[0]
+    new_noext = os.path.splitext(new_name)[0]
+
+    now = datetime.now()
+    timestamp = datetime.timestamp(now)
+
+    filename = "{}-{}-{}-diff.{}".format(old_noext, new_noext, timestamp, ext)
+    f = open(filename, "w+", encoding="utf-8")
+    f.writelines(diff_statements)
+    f.close()
+
+    return filename
+
 if __name__ == '__main__':
-    old = "heroesContentsOrig.db3" #input("Please enter the name of the older database file: ")
+    old = input("Please enter the name of the older database file: ")
     old_conn = create_connection(old)
 
     while(old_conn is None):
         old = input("Invalid database file, please enter again: ")
         old_conn = create_connection(old)
 
-    new = "heroesContentsFashion.db3" # input("Please enter the name of the newer database file: ")
+    new = input("Please enter the name of the newer database file: ")
     new_conn = create_connection(new)
 
     while(old_conn is None):
         old = input("Invalid database file, please enter again: ")
         old_conn = create_connection(old)
 
-    get_table_structure_diff(old_conn, new_conn, old, new)
+    print('Both files are found and valid SQLite files.. making comparisons..')
+    diff_statements = get_table_data_diff(old_conn, new_conn, old, new)
+    filename = write_to_file(old, new, diff_statements)
+    print('Comparison complete. Diff file generated - {}'.format(filename))
