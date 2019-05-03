@@ -43,11 +43,18 @@ def get_common_tables(old_conn, new_conn):
     return [value for value in new_tables if value in old_tables] 
 
 def format_sqlite_value(in_value):
-    """ will add quotes around it if its a string
+    """ will add quotes around it if its a string or convert the string to NULL if it is a python None value
     :param
-        in_value: an object that is to be returned with or without quotes
+        in_value: an object that is to be returned with or without quotes. NULL if None
     """
-    return in_value if type(input) in (int, float, bool) else "'{}'".format(in_value)
+    if type(in_value) in (int, float, bool):
+        return str(in_value)
+    elif in_value is None:
+        return "NULL"
+    else:
+        # escape strings with single-quotes
+        in_value = in_value.replace("'", "''")
+        return "'{}'".format(in_value)
 
 def append_eql_condition(in_value):
     """ appends an equal condition to a string but the function will
@@ -75,7 +82,6 @@ def get_primary_key(conn, table, columns):
     row = conn.execute(select_row_query).fetchone()
 
     if row is not None:
-        lastCount = 0
         for i, column in enumerate(columns):
             if i == 0:
                 count_row_query = count_row_query.format(table, column)
@@ -89,7 +95,6 @@ def get_primary_key(conn, table, columns):
 
             primary_key.append(column)
             count = conn.execute(count_row_query).fetchone()
-            lastCount = count[0]
 
             if count[0] == 1:
                 return primary_key
@@ -117,7 +122,11 @@ def generate_insert_query(table, pk, data, column = ''):
     """
 
     insert_query_template = "INSERT INTO `{}` {} VALUES ({});"
-    data_list = [format_sqlite_value(key) for key in pk] + [format_sqlite_value(d) for d in data]
+    
+    if data is None:
+        data_list = [format_sqlite_value(key) for key in pk]
+    else:
+        data_list = [format_sqlite_value(key) for key in pk] + [format_sqlite_value(d) for d in data]
 
     return insert_query_template.format(table, column, ', '.join(data_list))
 
@@ -190,6 +199,11 @@ def get_table_data_diff(old_conn, new_conn, old_db_filename, new_db_filename):
             columns = [col[1] for col in old_schema]
             orig_pk = get_primary_key(old_cursor, table, columns)
             data_cols_array = list(set(columns) - set(orig_pk))
+            all_cols_are_pk = len(data_cols_array) == 0
+
+            new_insert_order = orig_pk.copy()
+            new_insert_order.extend(data_cols_array)
+            new_insert_order = "(" + ", ".join("`{}`".format(c) for c in new_insert_order) + ")"
 
             if DEBUG:
                 print("primary: {} ({}), others: {} ({})".format(orig_pk, len(orig_pk), data_cols_array, len(data_cols_array)))
@@ -199,7 +213,7 @@ def get_table_data_diff(old_conn, new_conn, old_db_filename, new_db_filename):
             # this will generate the statement to select "primary key"
             select_by_pk = select_column_rows_query.format(pk, table) 
 
-            if len(data_cols_array) == 0:
+            if all_cols_are_pk:
                 # get everything if the primary key are all the columns
                 select_rows_stmt = select_all_rows_query.format(table)
                 old_row_data = old_cursor.execute(select_rows_stmt).fetchall()
@@ -237,16 +251,13 @@ def get_table_data_diff(old_conn, new_conn, old_db_filename, new_db_filename):
                 new_hashmap_pk_unhashed = dict(zip(new_row_ids_hashed, new_rows_ids))
                 new_hashmap_data_unhashed = dict(zip(new_row_ids_hashed, new_row_data))
 
-                not_inside_count = 0
-                inside_count = 0
-                new_row_count = 0
-                data_changed = 0
+                not_inside_count, inside_count, new_row_count, data_changed = (0, 0, 0, 0)
                 for index, old_hashed_pk in enumerate(old_row_ids_hashed):
                     # Attempts to get the row information from the hashed primary key
                     # returns false if not present in the dictionary
                     in_new_table = new_hashmap.get(old_hashed_pk, False)
 
-                    where_cols = (data_cols_array, orig_pk) [len(data_cols_array) == 0]
+                    where_cols = (data_cols_array, orig_pk) [all_cols_are_pk] #if all columns are pk, then data column is empty, switch to orig_pk
                     old_row = old_row_data[index]
 
                     if not in_new_table:
@@ -263,7 +274,7 @@ def get_table_data_diff(old_conn, new_conn, old_db_filename, new_db_filename):
 
                             if DEBUG:
                                 print("Comparing hash in new table ({}) to old ({})".format(in_new_table, old_hashmap[old_hashed_pk]))
-                            # TODO: go look for the data which belongs to the new data and then do an UPDATE SET statement for starters
+                            # go look for the data which belongs to the new data and then do an UPDATE SET statement for starters
                             update_string = generate_update_query(table, where_cols, old_row, where_cols, new_hashmap_data_unhashed[old_hashed_pk]) + '\n'
                             diff_statements.append(update_string)
                             data_changed += 1
@@ -276,8 +287,9 @@ def get_table_data_diff(old_conn, new_conn, old_db_filename, new_db_filename):
                     if not in_old_table:
                         # generate insert statement
                         new_pk = new_hashmap_pk_unhashed[new_hash_pk]
-                        new_data = new_hashmap_data_unhashed[new_hash_pk]
-                        diff_statements.append(generate_insert_query(table, new_pk, new_data) + '\n')
+                        new_data = (new_hashmap_data_unhashed[new_hash_pk], None) [all_cols_are_pk] # pass nothing so we don't generate double insert values
+
+                        diff_statements.append(generate_insert_query(table, new_pk, new_data, new_insert_order) + '\n')
                         new_row_count += 1
                 
                 if DEBUG:
@@ -311,6 +323,11 @@ def write_to_file(old_name, new_name, diff_statements, ext = "sql"):
 
     return filename
 
+def remove_dupes(seq):
+    # f7 in https://www.peterbe.com/plog/uniqifiers-benchmark
+    seen = set()
+    seen_add = seen.add
+    return [x for x in seq if not (x in seen or seen_add(x))]
 if __name__ == '__main__':
     old = input("Please enter the name of the older database file: ")
     old_conn = create_connection(old)
@@ -328,5 +345,12 @@ if __name__ == '__main__':
 
     print('Both files are found and valid SQLite files.. making comparisons..')
     diff_statements = get_table_data_diff(old_conn, new_conn, old, new)
-    filename = write_to_file(old, new, diff_statements)
-    print('Comparison complete. Diff file generated - {}'.format(filename))
+    
+    diff_statements = remove_dupes(diff_statements)
+
+    print('Comparison complete.')
+    if len(diff_statements) > 0:
+        filename = write_to_file(old, new, diff_statements)
+        print('Diff file generated - {}'.format(filename))
+    else:
+        print('No difference found for the two files.')
