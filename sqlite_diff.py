@@ -56,13 +56,16 @@ def format_sqlite_value(in_value):
         in_value = in_value.replace("'", "''")
         return "'{}'".format(in_value)
 
-def append_eql_condition(in_value):
+def append_eql_condition(in_value, update = False):
     """ appends an equal condition to a string but the function will
         add quotes around it if its a string
     :param
         in_value: an object that is to be converted to the equals clause
     """
-    return "=" + format_sqlite_value(in_value)
+    if in_value is None and not update:
+        return " is " + format_sqlite_value(in_value)
+    else:
+        return "=" + format_sqlite_value(in_value)
 
 def get_primary_key(conn, table, columns):
     """ attempts to reverse lookup the primary key by querying the table using the first column
@@ -88,10 +91,7 @@ def get_primary_key(conn, table, columns):
             else:
                 count_row_query += " AND `{}`".format(column)
             
-            if row[i] is None:
-                count_row_query += "=NULL"
-            else:
-                count_row_query += append_eql_condition(row[i])
+            count_row_query += append_eql_condition(row[i])
 
             primary_key.append(column)
             count = conn.execute(count_row_query).fetchone()
@@ -102,11 +102,11 @@ def get_primary_key(conn, table, columns):
     # if no primary key was found then the primary key is made up of all columns
     return columns
 
-def equal_stmt_list_generator(columns, data):
+def equal_stmt_list_generator(columns, data, update = False):
     statement_list = []
     for col_idx, col_value in enumerate(data):
         col_name = columns[col_idx]
-        statement_list.append('`{}`'.format(col_name) + append_eql_condition(col_value))
+        statement_list.append('`{}`'.format(col_name) + append_eql_condition(col_value, update))
     
     return statement_list
 
@@ -144,7 +144,7 @@ def generate_update_query(table, where_cols, where_data, update_cols, update_dat
     """
 
     update_query_template = "UPDATE `{}` SET {} WHERE {};"
-    update_set = equal_stmt_list_generator(update_cols, update_data)
+    update_set = equal_stmt_list_generator(update_cols, update_data, True)
     where_clauses = equal_stmt_list_generator(where_cols, where_data)
 
     return update_query_template.format(table, ', '.join(update_set), ' AND '.join(where_clauses))
@@ -275,8 +275,8 @@ def get_table_data_diff(old_conn, new_conn, old_db_filename, new_db_filename):
                             if DEBUG:
                                 print("Comparing hash in new table ({}) to old ({})".format(in_new_table, old_hashmap[old_hashed_pk]))
                             # go look for the data which belongs to the new data and then do an UPDATE SET statement for starters
-                            update_string = generate_update_query(table, where_cols, old_row, where_cols, new_hashmap_data_unhashed[old_hashed_pk]) + '\n'
-                            diff_statements.append(update_string)
+                            #update_string = generate_update_query(table, where_cols, old_row, where_cols, new_hashmap_data_unhashed[old_hashed_pk]) + '\n'
+                            #diff_statements.append(update_string)
                             data_changed += 1
 
                         inside_count += 1
