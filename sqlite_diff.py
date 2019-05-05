@@ -328,6 +328,7 @@ def remove_dupes(seq):
     seen = set()
     seen_add = seen.add
     return [x for x in seq if not (x in seen or seen_add(x))]
+
 if __name__ == '__main__':
     old = input("Please enter the name of the older database file: ")
     old_conn = create_connection(old)
